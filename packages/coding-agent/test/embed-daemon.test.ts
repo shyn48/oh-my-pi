@@ -17,6 +17,7 @@ import {
 	type MnemopiEmbedWorkerHandle,
 	type MnemopiSubprocessEmbeddingModel,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-client";
+import { embedDaemonEndpoint } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-protocol";
 import type { Subprocess } from "bun";
 
 const FIXTURE = path.join(import.meta.dir, "fixtures", "embed-daemon-fake.ts");
@@ -36,8 +37,11 @@ afterEach(async () => {
 	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+/** Short base so `<dir>/embed.sock` fits `sun_path` even where `os.tmpdir()` is a long sandbox path. */
+const TMP_BASE = process.platform === "win32" ? os.tmpdir() : "/tmp";
+
 function makeDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-embed-"));
+	const dir = fs.mkdtempSync(path.join(TMP_BASE, "omp-embed-"));
 	dirs.push(dir);
 	return dir;
 }
@@ -65,6 +69,9 @@ function makeClient(
 	dir: string,
 	env: Record<string, string> = {},
 	requestTimeoutMs?: number,
+	spawnChild: () => MnemopiEmbedWorkerHandle = () => {
+		throw new Error("per-process child must not be used");
+	},
 ): { client: MnemopiEmbedClient; spawns: () => number } {
 	let spawns = 0;
 	const client = new MnemopiEmbedClient(
@@ -76,9 +83,7 @@ function makeClient(
 					spawns += 1;
 					startDaemon(dir, env);
 				},
-				spawnChild: () => {
-					throw new Error("per-process child must not be used");
-				},
+				spawnChild,
 			}),
 		requestTimeoutMs,
 	);
@@ -144,16 +149,26 @@ describe("shared mnemopi embed daemon", () => {
 		expect(await embedOnce(wrapper!, "still-here")).toEqual([[10]]);
 	}, 30_000);
 
-	it("refuses a different model instead of reloading under other clients", async () => {
+	it("refuses a different model and serves that client from a private child instead", async () => {
 		const dir = makeDir();
 		const a = makeClient(dir);
-		const b = makeClient(dir);
+		let childSpawns = 0;
+		const b = makeClient(dir, {}, undefined, () => {
+			childSpawns += 1;
+			return fakeChild();
+		});
 		const wrapperA = await a.client.initialize(MODEL, undefined);
 		expect(wrapperA).not.toBeNull();
 
-		expect(await b.client.initialize("fast-other-model", undefined)).toBeNull();
+		const wrapperB = await b.client.initialize("fast-other-model", undefined);
+		expect(wrapperB).not.toBeNull();
+		// The vectors come from the private child (the fake daemon would answer the same), and
+		// the daemon neither reloaded nor was left with a dropped-connection error.
+		expect(await embedOnce(wrapperB!, "abcd")).toEqual([[4]]);
+		expect(childSpawns).toBe(1);
 		expect(await embedOnce(wrapperA!, "abc")).toEqual([[3]]);
 		expect(fakeLog(dir).filter(line => line.startsWith("init "))).toHaveLength(1);
+		expect(fakeLog(dir).some(line => line.startsWith("embed abcd"))).toBe(false);
 	}, 30_000);
 
 	it("exits when idle, but keeps the model while a client stays connected", async () => {
@@ -211,8 +226,9 @@ describe("shared mnemopi embed daemon", () => {
 
 	it("retires a daemon whose embed hangs so the next session gets a fresh one", async () => {
 		const dir = makeDir();
-		// The daemon judges the hang against the same timeout the clients use.
-		const env = { MNEMOPI_EMBED_REQUEST_TIMEOUT_MS: "1000" };
+		// The daemon judges the hang against this timeout (half of it must have elapsed);
+		// its own wedge budget stays above the clients' 3 s so the client-side retire path runs.
+		const env = { MNEMOPI_EMBED_REQUEST_TIMEOUT_MS: "4000" };
 		const a = makeClient(dir, env, 3000);
 		const b = makeClient(dir, env, 3000);
 		const wrapperA = await a.client.initialize(MODEL, undefined);
@@ -312,6 +328,89 @@ describe("shared mnemopi embed daemon", () => {
 		expect(await embedOnce(wrapper!, "ab")).toEqual([[2]]);
 		expect(childSpawns).toBe(1);
 	}, 15_000);
+
+	it("waits out a daemon blocked in a synchronous model load instead of using a private child", async () => {
+		const dir = makeDir();
+		const env = { FAKE_EMBED_LOAD_BLOCK_MS: "3000" };
+		const a = makeClient(dir, env);
+		const b = makeClient(dir, env);
+
+		const initA = a.client.initialize(MODEL, undefined);
+		// The daemon is now frozen inside the load; the second client connects into that silence.
+		await waitFor(() => fakeLog(dir).some(line => line.startsWith("init ")));
+		const initB = b.client.initialize(MODEL, undefined);
+		const [wrapperA, wrapperB] = await Promise.all([initA, initB]);
+		expect(wrapperA).not.toBeNull();
+		expect(wrapperB).not.toBeNull();
+
+		expect(await embedOnce(wrapperA!, "hello")).toEqual([[5]]);
+		expect(await embedOnce(wrapperB!, "hi")).toEqual([[2]]);
+		// A spawnChild call would have thrown inside makeClient; one daemon, one load.
+		expect(a.spawns() + b.spawns()).toBe(1);
+		expect(procs).toHaveLength(1);
+		expect(fakeLog(dir).filter(line => line.startsWith("init "))).toHaveLength(1);
+	}, 30_000);
+
+	it("an old-build daemon honours shutdown from two new-build clients that arrive together", async () => {
+		const dir = makeDir();
+		const old = startDaemon(dir, { FAKE_EMBED_BUILD: "old-build" });
+		await waitFor(() => fs.existsSync(path.join(dir, "embed.sock")));
+		const a = makeClient(dir);
+		const b = makeClient(dir);
+
+		const [wrapperA, wrapperB] = await Promise.all([
+			a.client.initialize(MODEL, undefined),
+			b.client.initialize(MODEL, undefined),
+		]);
+		expect(wrapperA).not.toBeNull();
+		expect(wrapperB).not.toBeNull();
+		expect(await exitedOrTimeout(old, 10_000)).not.toBe("timeout");
+
+		expect(await embedOnce(wrapperA!, "hello")).toEqual([[5]]);
+		expect(await embedOnce(wrapperB!, "hi")).toEqual([[2]]);
+		// One new daemon serves both: a single load (a racing second spawn loses the lock).
+		expect(fakeLog(dir).filter(line => line.startsWith("init "))).toHaveLength(1);
+	}, 30_000);
+
+	it("moves the socket to the temp dir when the runtime dir path is too long", async () => {
+		const dir = path.join(makeDir(), "d".repeat(110));
+		fs.mkdirSync(dir);
+		// The fallback socket sits in os.tmpdir(), which can itself be long (sandboxes); pin it short.
+		const previousTmp = process.env.TMPDIR;
+		process.env.TMPDIR = TMP_BASE;
+		try {
+			const endpoint = embedDaemonEndpoint(dir);
+			expect(endpoint).not.toContain(dir);
+			expect(path.basename(endpoint)).toStartWith("omp-mnemopi-embed-");
+			dirs.push(endpoint);
+
+			const { client } = makeClient(dir);
+			const wrapper = await client.initialize(MODEL, undefined);
+			expect(wrapper).not.toBeNull();
+			expect(await embedOnce(wrapper!, "long")).toEqual([[4]]);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect(fs.existsSync(path.join(dir, "embed.lock"))).toBe(true);
+		} finally {
+			if (previousTmp === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = previousTmp;
+		}
+	}, 30_000);
+
+	it("retires itself when an embed outlives the request budget, with no client action", async () => {
+		const dir = makeDir();
+		// The client never times out here: only the daemon's own budget can end this.
+		const { client } = makeClient(dir, { MNEMOPI_EMBED_REQUEST_TIMEOUT_MS: "500" }, 60_000);
+		const wrapper = await client.initialize(MODEL, undefined);
+		expect(wrapper).not.toBeNull();
+		const daemon = procs[0]!;
+
+		const inFlight = embedOnce(wrapper!, "hang").then(
+			() => "resolved",
+			() => "rejected",
+		);
+		expect(await exitedOrTimeout(daemon, 10_000)).not.toBe("timeout");
+		expect(await inFlight).toBe("rejected");
+	}, 30_000);
 });
 
 /** In-process stand-in for the per-process child: vectors are `[text.length]`. */

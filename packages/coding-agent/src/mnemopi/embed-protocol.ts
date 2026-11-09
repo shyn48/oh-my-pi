@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
@@ -30,7 +31,9 @@ export type MnemopiEmbedWorkerOutbound =
 	| { type: "pong"; id: string }
 	| { type: "ready"; id: string }
 	| { type: "vectors"; id: string; vectors: number[][] }
-	| { type: "error"; id: string; error: string }
+	// `code: "pinned"`: the shared daemon is bound to another model/cacheDir and refused this one;
+	// the daemon client answers it by moving to a private per-process child instead of failing.
+	| { type: "error"; id: string; error: string; code?: "pinned" }
 	// `id` is set when the line was caused by that request, so the shared daemon
 	// can forward it to the one client that asked instead of every connection.
 	| { type: "log"; id?: string; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> };
@@ -62,7 +65,7 @@ export type MnemopiEmbedDaemonOutbound =
  * Daemon build identity. The package version covers releases; bump the revision
  * when this protocol changes without a version bump (dev checkouts).
  */
-const PROTOCOL_REV = 2;
+const PROTOCOL_REV = 3;
 export const MNEMOPI_EMBED_BUILD = `${VERSION}+p${PROTOCOL_REV}`;
 
 /**
@@ -82,10 +85,18 @@ export function embedDaemonDir(): string {
 	return process.env.MNEMOPI_EMBED_DAEMON_DIR || getGlobalDaemonRuntimeDir("mnemopi-embed");
 }
 
-/** Unix socket under the runtime dir, or a Windows named pipe keyed by that dir (which sits under the user's home). */
+/** Longest unix socket path used as is; `sun_path` caps at 104 (macOS) / 108 (Linux) bytes. */
+const MAX_SOCKET_PATH_BYTES = 100;
+
+/**
+ * Unix socket under the runtime dir, or a Windows named pipe keyed by that dir
+ * (which sits under the user's home). A unix path that would not fit `sun_path`
+ * moves to the temp dir, keyed the same way; the lock stays in the runtime dir.
+ */
 export function embedDaemonEndpoint(dir: string): string {
-	if (process.platform === "win32") {
-		return `\\\\.\\pipe\\omp-mnemopi-embed-${Bun.hash.wyhash(path.resolve(dir)).toString(16).padStart(16, "0")}`;
-	}
-	return path.join(dir, "embed.sock");
+	const key = Bun.hash.wyhash(path.resolve(dir)).toString(16).padStart(16, "0");
+	if (process.platform === "win32") return `\\\\.\\pipe\\omp-mnemopi-embed-${key}`;
+	const socket = path.join(dir, "embed.sock");
+	if (Buffer.byteLength(socket) <= MAX_SOCKET_PATH_BYTES) return socket;
+	return path.join(os.tmpdir(), `omp-mnemopi-embed-${key}.sock`);
 }

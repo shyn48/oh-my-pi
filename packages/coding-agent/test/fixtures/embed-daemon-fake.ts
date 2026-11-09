@@ -3,7 +3,9 @@
  * swapped for a fake so no model or network is needed. Every model load and
  * every embed is appended to `FAKE_EMBED_LOG` (`init <model> pid=<pid>`,
  * `embed <first text>`), which is how the test counts loads across processes.
- * An embed whose first text is `hang` never answers.
+ * An embed whose first text is `hang` never answers. `FAKE_EMBED_LOAD_BLOCK_MS`
+ * makes a model load block the whole event loop that long, like onnxruntime's
+ * synchronous `InferenceSession` creation.
  */
 import * as fs from "node:fs";
 import { startEmbedDaemonFromEnvironment } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-daemon";
@@ -15,6 +17,8 @@ await startEmbedDaemonFromEnvironment({
 	...(process.env.FAKE_EMBED_BUILD ? { build: process.env.FAKE_EMBED_BUILD } : {}),
 	async load(model) {
 		fs.appendFileSync(logFile, `init ${model} pid=${process.pid}\n`);
+		const blockMs = Number(process.env.FAKE_EMBED_LOAD_BLOCK_MS);
+		if (blockMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, blockMs);
 		return {
 			async *embed(texts) {
 				fs.appendFileSync(logFile, `embed ${texts[0]}\n`);

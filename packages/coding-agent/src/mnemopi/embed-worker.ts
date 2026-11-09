@@ -49,6 +49,18 @@ const loadFastembedModel: EmbedModelLoader = (model, cacheDir) =>
 		showDownloadProgress: false,
 	});
 
+/** A pinned handler refused a `(model, cacheDir)` other than the one it serves. */
+class PinnedModelError extends Error {}
+
+function errorReply(id: string, error: unknown): MnemopiEmbedWorkerOutbound {
+	return {
+		type: "error",
+		id,
+		error: error instanceof Error ? error.message : String(error),
+		...(error instanceof PinnedModelError ? { code: "pinned" as const } : {}),
+	};
+}
+
 export interface EmbedHandlerOptions {
 	load?: EmbedModelLoader;
 	/**
@@ -76,7 +88,7 @@ export function createMnemopiEmbedHandler({
 		if (loaded !== null && loadedKey === key) return loaded;
 		if (pinned && loaded !== null) {
 			return Promise.reject(
-				new Error(
+				new PinnedModelError(
 					`mnemopi embed daemon is bound to another model/cacheDir; refusing ${model} (cacheDir ${cacheDir ?? "default"})`,
 				),
 			);
@@ -115,7 +127,7 @@ export function createMnemopiEmbedHandler({
 			}
 			send({ type: "vectors", id: message.id, vectors });
 		} catch (error) {
-			send({ type: "error", id: message.id, error: error instanceof Error ? error.message : String(error) });
+			send(errorReply(message.id, error));
 		}
 	}
 
@@ -127,7 +139,7 @@ export function createMnemopiEmbedHandler({
 			await ensureLoaded(message.model, message.cacheDir);
 			send({ type: "ready", id: message.id });
 		} catch (error) {
-			send({ type: "error", id: message.id, error: error instanceof Error ? error.message : String(error) });
+			send(errorReply(message.id, error));
 		}
 	}
 

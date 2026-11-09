@@ -9,9 +9,9 @@
  * machine-wide runtime dir, carrying the same `ping/init/embed` →
  * `pong/ready/vectors/error` messages the per-process child speaks plus the
  * `hello` → `welcome` build handshake (`embed-protocol.ts`). One daemon serves
- * one `(model, cacheDir)`; any other request is answered with an error and the
- * client falls back to its own child, so a model is never reloaded under
- * another session's feet.
+ * one `(model, cacheDir)`; any other request is answered with an error tagged
+ * `code: "pinned"` and that client moves to its own private child, so a model
+ * is never reloaded under another session's feet.
  */
 
 import * as fs from "node:fs";
@@ -83,6 +83,9 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 	const log = createDaemonLog(path.join(dir, "embed.log"));
 	const handler = createMnemopiEmbedHandler({ load: options.load, pinned: true });
 	const clients = new Set<net.Socket>();
+	// Connections that finished a build-matching handshake or sent work: the sessions this daemon serves.
+	const served = new Set<net.Socket>();
+	const budgets = new Set<NodeJS.Timeout>();
 	const finished = Promise.withResolvers<void>();
 	let inflight = 0;
 	let idleTimer: NodeJS.Timeout | undefined;
@@ -122,6 +125,7 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 		const dispatch = (message: MnemopiEmbedDaemonInbound): void => {
 			switch (message.type) {
 				case "hello":
+					if (message.build === build) served.add(socket);
 					send({ type: "welcome", id: message.id, build, pid: process.pid });
 					return;
 				case "shutdown": {
@@ -137,20 +141,39 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 						}
 						return;
 					}
-					// A mismatched client may only retire a daemon nobody else uses;
-					// otherwise mixed-version sessions would kill each other's daemon in a loop.
-					if (clients.size === 1) stop("shutdown requested by a client on another build");
+					// A mismatched client may only retire a daemon no session is being served by
+					// (sockets still handshaking do not count); otherwise mixed-version sessions
+					// would kill each other's daemon in a loop.
+					if (served.size === 0) stop("shutdown requested by a client on another build");
 					else send({ type: "error", id: message.id, error: "mnemopi embed daemon is in use by other sessions" });
 					return;
 				}
-				default:
+				default: {
+					// Ping is a liveness probe; init/embed make this connection a user of the pinned model.
+					if (message.type !== "ping") served.add(socket);
 					inflight++;
 					started.set(message.id, Date.now());
+					// Wall-clock budget for an embed (init is exempt: first use may download the
+					// model): past it the native runtime is wedged for every session, whether or not
+					// the asking client still listens, so the daemon retires itself.
+					const budget =
+						message.type === "embed"
+							? setTimeout(
+									() => stop(`embed request ${message.id} exceeded ${requestTimeoutMs} ms: wedged`),
+									requestTimeoutMs,
+								)
+							: undefined;
+					if (budget) budgets.add(budget);
 					void handler.handle(message, send).finally(() => {
 						inflight--;
 						started.delete(message.id);
+						if (budget) {
+							clearTimeout(budget);
+							budgets.delete(budget);
+						}
 						scheduleIdle();
 					});
+				}
 			}
 		};
 		let buffer = "";
@@ -174,6 +197,7 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 		});
 		socket.on("close", () => {
 			clients.delete(socket);
+			served.delete(socket);
 			scheduleIdle();
 		});
 	});
@@ -194,6 +218,7 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 	} finally {
 		cancelCleanup();
 		clearTimeout(idleTimer);
+		for (const timer of budgets) clearTimeout(timer);
 		// Order matters: drop the socket file and the lock BEFORE disconnecting
 		// clients, so a client that reacts to the close by respawning us finds a
 		// free lock instead of losing to a daemon that is already leaving.

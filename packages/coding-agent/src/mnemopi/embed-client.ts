@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import * as os from "node:os";
 import { isFastembedModelCached } from "@oh-my-pi/pi-mnemopi/core/fastembed-model-cache";
 import { getFastembedCacheDir, logger } from "@oh-my-pi/pi-utils";
 import { MNEMOPI_EMBED_DAEMON_WORKER_ARG } from "../cli/worker-selectors";
@@ -118,10 +119,10 @@ function spawnMnemopiEmbedProcessWorker(): MnemopiEmbedWorkerHandle {
 	);
 }
 
-/** Total budget for reaching (starting, if needed) the shared daemon before falling back to a private child. */
+/** Budget for reaching (starting, if needed) the shared daemon: how long to keep retrying while nothing listens. */
 const DAEMON_CONNECT_DEADLINE_MS = 5_000;
-/** A live daemon answers `hello` from its event loop; silence this long means wedged, not busy. */
-const DAEMON_HANDSHAKE_TIMEOUT_MS = 2_000;
+/** Once connected a daemon exists, though it may be blocked in a synchronous model load: wait this long for its answer. */
+const DAEMON_CONNECTED_DEADLINE_MS = 60_000;
 
 export interface EmbedWorkerHandleOptions {
 	/** Runtime dir of the daemon; defaults to the machine-wide one. */
@@ -135,12 +136,30 @@ export interface EmbedWorkerHandleOptions {
 	connectDeadlineMs?: number;
 }
 
+/**
+ * Env the detached daemon gets. It outlives this session and serves every
+ * later one, so it must not inherit this session's environment (API keys,
+ * tokens, per-project config): only what it needs to find its runtime dir and
+ * model, reach the network and load native libraries. The model cache dir
+ * travels in each request, not the env. The trailing Windows names are OS
+ * basics a process there cannot start without.
+ */
+const DAEMON_ENV_KEEP =
+	/^(PATH|HOME|USER|TMPDIR|XDG_.*|LANG|LC_.*|OMP_NATIVE_LIBRARY_PATH|LD_LIBRARY_PATH|DYLD_.*|HF_HUB_.*|HTTPS?_PROXY|NO_PROXY|MNEMOPI_.*|SystemRoot|windir|TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|COMSPEC|PATHEXT)$/i;
+
 function spawnEmbedDaemon(): void {
 	const spawn = resolveWorkerSpawnCmd(MNEMOPI_EMBED_DAEMON_WORKER_ARG);
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(inferenceWorkerEnv())) {
+		if (DAEMON_ENV_KEEP.test(key)) env[key] = value;
+	}
 	// Detached + unref'd: the daemon outlives this session and serves the next ones.
+	// cwd is the home dir, never this session's project dir (it would pin that dir
+	// and leak into terminal cwd heuristics); `spawn.cwd` is only the package root
+	// that a dev checkout's relative `src/cli.ts` entry needs.
 	Bun.spawn(spawn.cmd, {
-		cwd: spawn.cwd,
-		env: inferenceWorkerEnv(),
+		cwd: spawn.cwd ?? os.homedir(),
+		env,
 		stdin: "ignore",
 		stdout: "ignore",
 		stderr: "ignore",
@@ -164,22 +183,35 @@ function openSocket(endpoint: string): Promise<net.Socket> {
 	return promise;
 }
 
-/** First complete JSON line from the daemon, or `undefined` when the socket closes or stays silent. */
-function nextMessage(socket: net.Socket, timeoutMs: number): Promise<MnemopiEmbedDaemonOutbound | undefined> {
-	const { promise, resolve } = Promise.withResolvers<MnemopiEmbedDaemonOutbound | undefined>();
+/**
+ * First complete JSON line from the daemon plus the bytes buffered behind it,
+ * or `undefined` when the socket closes, stays silent for `timeoutMs`, or `signal` aborts.
+ */
+function nextMessage(
+	socket: net.Socket,
+	timeoutMs: number,
+	signal: AbortSignal,
+): Promise<{ message: MnemopiEmbedDaemonOutbound; rest: string } | undefined> {
+	const { promise, resolve } = Promise.withResolvers<
+		{ message: MnemopiEmbedDaemonOutbound; rest: string } | undefined
+	>();
 	let buffer = "";
-	const done = (message: MnemopiEmbedDaemonOutbound | undefined): void => {
+	const done = (result: { message: MnemopiEmbedDaemonOutbound; rest: string } | undefined): void => {
 		clearTimeout(timer);
 		socket.removeListener("data", onData);
 		socket.removeListener("close", onClose);
-		resolve(message);
+		signal.removeEventListener("abort", onClose);
+		resolve(result);
 	};
 	const onData = (chunk: string): void => {
 		buffer += chunk;
 		const newline = buffer.indexOf("\n");
 		if (newline < 0) return;
 		try {
-			done(JSON.parse(buffer.slice(0, newline)) as MnemopiEmbedDaemonOutbound);
+			done({
+				message: JSON.parse(buffer.slice(0, newline)) as MnemopiEmbedDaemonOutbound,
+				rest: buffer.slice(newline + 1),
+			});
 		} catch {
 			done(undefined);
 		}
@@ -188,6 +220,7 @@ function nextMessage(socket: net.Socket, timeoutMs: number): Promise<MnemopiEmbe
 	const timer = setTimeout(onClose, timeoutMs);
 	socket.on("data", onData);
 	socket.once("close", onClose);
+	signal.addEventListener("abort", onClose, { once: true });
 	return promise;
 }
 
@@ -199,17 +232,18 @@ function sendLine(socket: net.Socket, message: MnemopiEmbedDaemonInbound): void 
  * Connect to the shared daemon, starting it when nothing listens, and check it
  * runs our build. Resolves `undefined` when it cannot be reached or must not
  * be used (wedged, other build still serving other sessions); the caller then
- * falls back to a private child.
+ * falls back to a private child. `rest` is whatever arrived behind the welcome line.
  */
 async function connectEmbedDaemon(
 	options: Required<Omit<EmbedWorkerHandleOptions, "spawnChild">>,
-	isClosed: () => boolean,
-): Promise<net.Socket | undefined> {
+	signal: AbortSignal,
+): Promise<{ socket: net.Socket; rest: string } | undefined> {
 	const endpoint = embedDaemonEndpoint(options.dir);
-	const deadline = Date.now() + options.connectDeadlineMs;
+	// Budget for "no daemon yet" (ENOENT/ECONNREFUSED) only; a connected socket is judged separately.
+	let deadline = Date.now() + options.connectDeadlineMs;
 	let spawned = false;
 	let retired = false;
-	for (let delay = 25; Date.now() < deadline && !isClosed(); delay = Math.min(delay * 2, 250)) {
+	for (let delay = 25; Date.now() < deadline && !signal.aborted; delay = Math.min(delay * 2, 250)) {
 		let socket: net.Socket;
 		try {
 			socket = await openSocket(endpoint);
@@ -232,13 +266,16 @@ async function connectEmbedDaemon(
 			await Bun.sleep(delay);
 			continue;
 		}
+		// A connected socket proves a daemon exists, but it may be inside onnxruntime's
+		// synchronous session load and answer only once that returns: keep waiting.
 		sendLine(socket, { type: "hello", id: "hello", build: options.build });
-		const welcome = await nextMessage(socket, DAEMON_HANDSHAKE_TIMEOUT_MS);
-		if (welcome?.type !== "welcome") {
+		const first = await nextMessage(socket, DAEMON_CONNECTED_DEADLINE_MS, signal);
+		const welcome = first?.message;
+		if (!first || welcome?.type !== "welcome") {
 			socket.destroy();
 			return undefined;
 		}
-		if (welcome.build === options.build) return socket;
+		if (welcome.build === options.build) return { socket, rest: first.rest };
 		// Other build: retire it once and start ours. A daemon that stays up
 		// (refused because other sessions use it, or wedged) means fall back.
 		if (retired) {
@@ -247,10 +284,11 @@ async function connectEmbedDaemon(
 		}
 		retired = true;
 		sendLine(socket, { type: "shutdown", id: "shutdown" });
-		const reply = await nextMessage(socket, DAEMON_HANDSHAKE_TIMEOUT_MS);
+		const reply = await nextMessage(socket, DAEMON_CONNECTED_DEADLINE_MS, signal);
 		socket.destroy();
 		if (reply !== undefined) return undefined;
 		spawned = false;
+		deadline = Date.now() + options.connectDeadlineMs;
 	}
 	return undefined;
 }
@@ -272,6 +310,9 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 	const inbound = new Set<(message: MnemopiEmbedWorkerOutbound) => void>();
 	const errors = new Set<(error: Error) => void>();
 	const queue: MnemopiEmbedWorkerInbound[] = [];
+	// Requests sent to the daemon and not yet answered: replayed on a private child if the daemon refuses our model.
+	const unanswered = new Map<string, MnemopiEmbedWorkerInbound>();
+	const abort = new AbortController();
 	let sink: Pick<MnemopiEmbedWorkerHandle, "send" | "terminate" | "ref" | "unref" | "retire"> | undefined;
 	let closed = false;
 	let refed = false;
@@ -282,28 +323,62 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 		else target.unref();
 		for (const message of queue.splice(0)) target.send(message);
 	};
-	const attachSocket = (socket: net.Socket): void => {
-		let buffer = "";
-		socket.on("data", (chunk: string) => {
-			buffer += chunk;
-			for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+	const attachChild = (): void => {
+		const child = spawnChild();
+		child.onMessage(message => {
+			for (const handler of inbound) handler(message);
+		});
+		child.onError(error => {
+			for (const handler of errors) handler(error);
+		});
+		attach(child);
+	};
+	const attachSocket = (socket: net.Socket, rest: string): void => {
+		let buffer = rest;
+		let abandoned = false;
+		// The daemon refused our (model, cacheDir): it is pinned to another one. Leave it for a
+		// private child, which keeps this handle for its lifetime, and replay what was unanswered.
+		const abandon = (): void => {
+			abandoned = true;
+			socket.destroy();
+			if (closed) return;
+			logger.warn("mnemopi-embed: shared daemon serves another model; using a private embed subprocess");
+			queue.push(...unanswered.values());
+			unanswered.clear();
+			attachChild();
+		};
+		const drain = (): void => {
+			for (let newline = buffer.indexOf("\n"); newline >= 0 && !abandoned; newline = buffer.indexOf("\n")) {
 				const line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
 				try {
-					for (const handler of inbound) handler(JSON.parse(line) as MnemopiEmbedWorkerOutbound);
+					const message = JSON.parse(line) as MnemopiEmbedWorkerOutbound;
+					if (message.type === "error" && message.code === "pinned") {
+						abandon();
+						return;
+					}
+					if (message.type !== "log") unanswered.delete(message.id);
+					for (const handler of inbound) handler(message);
 				} catch (error) {
 					logger.debug("mnemopi-embed: bad daemon line", {
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
 			}
+		};
+		socket.on("data", (chunk: string) => {
+			buffer += chunk;
+			drain();
 		});
 		socket.on("close", () => {
-			if (closed) return;
+			if (closed || abandoned) return;
 			for (const handler of errors) handler(new Error("mnemopi embed daemon connection closed"));
 		});
 		attach({
-			send: message => sendLine(socket, message),
+			send: message => {
+				unanswered.set(message.id, message);
+				sendLine(socket, message);
+			},
 			ref: () => void socket.ref(),
 			unref: () => void socket.unref(),
 			retire(stuckId) {
@@ -321,6 +396,8 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 				socket.destroy();
 			},
 		});
+		// Bytes that arrived behind the welcome line.
+		drain();
 	};
 
 	void connectEmbedDaemon(
@@ -330,24 +407,17 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 			spawnDaemon: options.spawnDaemon ?? spawnEmbedDaemon,
 			connectDeadlineMs: options.connectDeadlineMs ?? DAEMON_CONNECT_DEADLINE_MS,
 		},
-		() => closed,
+		abort.signal,
 	)
 		.catch(() => undefined)
-		.then(socket => {
+		.then(connected => {
 			if (closed) {
-				socket?.destroy();
+				connected?.socket.destroy();
 				return;
 			}
-			if (socket) return attachSocket(socket);
+			if (connected) return attachSocket(connected.socket, connected.rest);
 			logger.warn("mnemopi-embed: shared daemon unavailable; using a private embed subprocess");
-			const child = spawnChild();
-			child.onMessage(message => {
-				for (const handler of inbound) handler(message);
-			});
-			child.onError(error => {
-				for (const handler of errors) handler(error);
-			});
-			attach(child);
+			attachChild();
 		});
 
 	return {
@@ -373,6 +443,7 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 		},
 		async terminate() {
 			closed = true;
+			abort.abort();
 			queue.length = 0;
 			await sink?.terminate();
 		},
@@ -428,7 +499,8 @@ export class MnemopiEmbedClient {
 	): Promise<MnemopiSubprocessEmbeddingModel | null> {
 		// fastembed exposes no byte progress; any missing model file means this
 		// init downloads it.
-		const cached = await isFastembedModelCached(model, cacheDir ?? getFastembedCacheDir());
+		const resolvedCacheDir = cacheDir ?? getFastembedCacheDir();
+		const cached = await isFastembedModelCached(model, resolvedCacheDir);
 		const tracker = cached ? undefined : trackDownload(model.replace(/^fast-/, ""), { detail: "downloading" });
 		try {
 			const worker = this.#ensureWorker();
@@ -436,7 +508,8 @@ export class MnemopiEmbedClient {
 			const { promise, resolve } = Promise.withResolvers<string | undefined>();
 			this.#addPending(id, { kind: "init", model, resolve });
 			try {
-				worker.send({ type: "init", id, model, cacheDir });
+				// The cacheDir is always explicit: the shared daemon pins on it and may run with another env.
+				worker.send({ type: "init", id, model, cacheDir: resolvedCacheDir });
 				const error = await promise;
 				if (error !== undefined) {
 					tracker?.fail(error);
@@ -454,7 +527,7 @@ export class MnemopiEmbedClient {
 			});
 			return null;
 		}
-		return { embed: (texts, batchSize) => this.#streamEmbed(model, cacheDir, texts, batchSize) };
+		return { embed: (texts, batchSize) => this.#streamEmbed(model, resolvedCacheDir, texts, batchSize) };
 	}
 
 	async terminate(): Promise<void> {

@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Mnemopi local embeddings now run in one shared per-machine daemon instead of one ~1 GB subprocess per session. The daemon starts on first use, exits after 10 idle minutes (`MNEMOPI_EMBED_DAEMON_IDLE_MS`), serves one model, and falls back to a private subprocess when unreachable; `MNEMOPI_EMBED_DAEMON=0` always uses the private subprocess. A client whose embed hits the request timeout asks the daemon to retire (it only agrees if that request has been in flight for over half the timeout), so one hung ONNX call no longer makes every session's embeds time out.
+- Mnemopi local embeddings now run in one shared per-machine daemon instead of one ~1 GB subprocess per session. The daemon starts on first use, exits after 10 idle minutes (`MNEMOPI_EMBED_DAEMON_IDLE_MS`), and serves one model; a session that asks for another model, or cannot reach the daemon, uses a private subprocess instead (`MNEMOPI_EMBED_DAEMON=0` always does). A session keeps waiting (up to 60 s) for a daemon that is busy loading its model rather than giving up on it. The daemon retires itself when an embed outlives the request timeout, and a session whose embed times out asks it to retire sooner (it only agrees if that request has been in flight for over half the timeout), so one hung ONNX call no longer makes every session's embeds time out. A daemon of another build is replaced once no session is being served by it. The daemon runs from the home directory with a reduced environment, and its socket moves to the temp dir when the runtime dir path is too long for a unix socket.
 
 ## [18.9.1] - 2026-10-11
 
