@@ -49,7 +49,10 @@ export interface MnemopiEmbedTransport {
 export type MnemopiEmbedDaemonInbound =
 	| MnemopiEmbedWorkerInbound
 	| { type: "hello"; id: string; build: string }
-	| { type: "shutdown"; id: string };
+	// `force` + `stuck` retire a daemon whose embed hung: honoured only when `stuck`
+	// names a request of this connection that has been in flight for over half
+	// {@link embedRequestTimeoutMs}.
+	| { type: "shutdown"; id: string; force?: true; stuck?: string };
 
 export type MnemopiEmbedDaemonOutbound =
 	| MnemopiEmbedWorkerOutbound
@@ -59,8 +62,17 @@ export type MnemopiEmbedDaemonOutbound =
  * Daemon build identity. The package version covers releases; bump the revision
  * when this protocol changes without a version bump (dev checkouts).
  */
-const PROTOCOL_REV = 1;
+const PROTOCOL_REV = 2;
 export const MNEMOPI_EMBED_BUILD = `${VERSION}+p${PROTOCOL_REV}`;
+
+/**
+ * Upper bound on a steady-state embed round-trip; the daemon judges a forced
+ * shutdown against it. `MNEMOPI_EMBED_REQUEST_TIMEOUT_MS` overrides it (tests).
+ */
+export function embedRequestTimeoutMs(): number {
+	const requested = Number(process.env.MNEMOPI_EMBED_REQUEST_TIMEOUT_MS);
+	return requested > 0 && Number.isFinite(requested) ? requested : 120_000;
+}
 
 /**
  * Machine-wide runtime dir (0700): one daemon, one lock, one socket for every

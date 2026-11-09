@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -63,20 +64,23 @@ function startDaemon(dir: string, env: Record<string, string> = {}): Subprocess 
 function makeClient(
 	dir: string,
 	env: Record<string, string> = {},
+	requestTimeoutMs?: number,
 ): { client: MnemopiEmbedClient; spawns: () => number } {
 	let spawns = 0;
-	const client = new MnemopiEmbedClient(() =>
-		createEmbedWorkerHandle({
-			dir,
-			build: BUILD,
-			spawnDaemon: () => {
-				spawns += 1;
-				startDaemon(dir, env);
-			},
-			spawnChild: () => {
-				throw new Error("per-process child must not be used");
-			},
-		}),
+	const client = new MnemopiEmbedClient(
+		() =>
+			createEmbedWorkerHandle({
+				dir,
+				build: BUILD,
+				spawnDaemon: () => {
+					spawns += 1;
+					startDaemon(dir, env);
+				},
+				spawnChild: () => {
+					throw new Error("per-process child must not be used");
+				},
+			}),
+		requestTimeoutMs,
 	);
 	clients.push(client);
 	return { client, spawns: () => spawns };
@@ -203,6 +207,61 @@ describe("shared mnemopi embed daemon", () => {
 		expect(await embedOnce(wrapper!, "again")).toEqual([[5]]);
 		expect(spawns()).toBe(2);
 		expect(fakeLog(dir).filter(line => line.startsWith("init "))).toHaveLength(2);
+	}, 30_000);
+
+	it("retires a daemon whose embed hangs so the next session gets a fresh one", async () => {
+		const dir = makeDir();
+		// The daemon judges the hang against the same timeout the clients use.
+		const env = { MNEMOPI_EMBED_REQUEST_TIMEOUT_MS: "1000" };
+		const a = makeClient(dir, env, 3000);
+		const b = makeClient(dir, env, 3000);
+		const wrapperA = await a.client.initialize(MODEL, undefined);
+		const wrapperB = await b.client.initialize(MODEL, undefined);
+		expect(wrapperA).not.toBeNull();
+		expect(wrapperB).not.toBeNull();
+		const wedged = procs[0]!;
+
+		// Two clients are connected, so only the hang itself can justify the shutdown.
+		await expect(embedOnce(wrapperA!, "hang")).rejects.toThrow("timed out");
+		expect(await exitedOrTimeout(wedged, 10_000)).not.toBe("timeout");
+		expect(fs.existsSync(path.join(dir, "embed.sock"))).toBe(false);
+
+		// Both sessions recover on their next call against one fresh daemon.
+		expect(await embedOnce(wrapperA!, "again")).toEqual([[5]]);
+		expect(await embedOnce(wrapperB!, "bee")).toEqual([[3]]);
+		expect(fakeLog(dir).filter(line => line.startsWith("init "))).toHaveLength(2);
+	}, 30_000);
+
+	it("a forced shutdown naming an unknown request is refused", async () => {
+		const dir = makeDir();
+		const daemon = startDaemon(dir);
+		await waitFor(() => fs.existsSync(path.join(dir, "embed.sock")));
+		const socket = net.createConnection({ path: path.join(dir, "embed.sock") });
+		socket.setEncoding("utf8");
+		const lines: string[] = [];
+		socket.on("data", (chunk: string) => lines.push(...chunk.split("\n").filter(Boolean)));
+		const send = (message: object): void => void socket.write(`${JSON.stringify(message)}\n`);
+		const reply = async (id: string): Promise<{ type: string }> => {
+			await waitFor(() => lines.some(line => JSON.parse(line).id === id));
+			return JSON.parse(lines.find(line => JSON.parse(line).id === id)!);
+		};
+		try {
+			send({ type: "init", id: "i", model: MODEL });
+			expect((await reply("i")).type).toBe("ready");
+
+			send({ type: "shutdown", id: "s1", force: true, stuck: "nope" });
+			expect((await reply("s1")).type).toBe("error");
+
+			// A real request that is not yet old enough (default timeout is 120 s) is no proof either.
+			send({ type: "embed", id: "e1", model: MODEL, texts: ["hang"] });
+			await waitFor(() => fakeLog(dir).includes("embed hang"));
+			send({ type: "shutdown", id: "s2", force: true, stuck: "e1" });
+			expect((await reply("s2")).type).toBe("error");
+
+			expect(await exitedOrTimeout(daemon, 300)).toBe("timeout");
+		} finally {
+			socket.destroy();
+		}
 	}, 30_000);
 
 	it("MNEMOPI_EMBED_DAEMON=0 uses the per-process child and never touches the daemon", async () => {

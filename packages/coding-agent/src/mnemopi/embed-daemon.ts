@@ -22,6 +22,7 @@ import { postmortem, setProcessName } from "@oh-my-pi/pi-utils";
 import {
 	embedDaemonDir,
 	embedDaemonEndpoint,
+	embedRequestTimeoutMs,
 	MNEMOPI_EMBED_BUILD,
 	type MnemopiEmbedDaemonInbound,
 	type MnemopiEmbedDaemonOutbound,
@@ -39,6 +40,8 @@ export interface EmbedDaemonOptions {
 	build: string;
 	/** Model loader override for tests. */
 	load?: EmbedModelLoader;
+	/** Embed timeout clients apply; a forced shutdown needs a request older than half of it. Defaults to the shared value. */
+	requestTimeoutMs?: number;
 }
 
 /** Append-only log in the runtime dir; truncated when it outgrows {@link MAX_LOG_BYTES}. Never throws. */
@@ -71,6 +74,7 @@ function createDaemonLog(file: string): (level: string, msg: string, meta?: Reco
  */
 export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boolean> {
 	const { dir, idleMs, build } = options;
+	const requestTimeoutMs = options.requestTimeoutMs ?? embedRequestTimeoutMs();
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const lock = FileLock.tryAcquire(path.join(dir, "embed.lock"));
 	if (!lock.acquired) return false;
@@ -101,6 +105,9 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 
 	const server = net.createServer(socket => {
 		clients.add(socket);
+		// Start time of each request this connection has in flight, by request id
+		// (ids are per-client counters, so they are only unique per connection).
+		const started = new Map<string, number>();
 		scheduleIdle();
 		socket.setEncoding("utf8");
 		const send = (message: MnemopiEmbedDaemonOutbound): void => {
@@ -117,16 +124,31 @@ export async function runEmbedDaemon(options: EmbedDaemonOptions): Promise<boole
 				case "hello":
 					send({ type: "welcome", id: message.id, build, pid: process.pid });
 					return;
-				case "shutdown":
+				case "shutdown": {
+					if (message.force) {
+						// Proof of a hang: the named request has been in flight for over
+						// half the client timeout. Then no other session can be served by
+						// this daemon either, however many are connected.
+						const since = message.stuck === undefined ? undefined : started.get(message.stuck);
+						if (since !== undefined && Date.now() - since > requestTimeoutMs / 2) {
+							stop(`embed request ${message.stuck} hung`);
+						} else {
+							send({ type: "error", id: message.id, error: "forced shutdown refused: no such hung request" });
+						}
+						return;
+					}
 					// A mismatched client may only retire a daemon nobody else uses;
 					// otherwise mixed-version sessions would kill each other's daemon in a loop.
 					if (clients.size === 1) stop("shutdown requested by a client on another build");
 					else send({ type: "error", id: message.id, error: "mnemopi embed daemon is in use by other sessions" });
 					return;
+				}
 				default:
 					inflight++;
+					started.set(message.id, Date.now());
 					void handler.handle(message, send).finally(() => {
 						inflight--;
+						started.delete(message.id);
 						scheduleIdle();
 					});
 			}

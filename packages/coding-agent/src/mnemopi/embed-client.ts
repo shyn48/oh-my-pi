@@ -19,6 +19,7 @@ import {
 import {
 	embedDaemonDir,
 	embedDaemonEndpoint,
+	embedRequestTimeoutMs,
 	MNEMOPI_EMBED_BUILD,
 	type MnemopiEmbedDaemonInbound,
 	type MnemopiEmbedDaemonOutbound,
@@ -35,7 +36,14 @@ import {
  * provider loads fastembed in the main process (issue #3031; the mnemopi
  * sibling of the tiny-model fix from #1606 / #1607).
  */
-export type MnemopiEmbedWorkerHandle = RefCountedWorkerHandle<MnemopiEmbedWorkerInbound, MnemopiEmbedWorkerOutbound>;
+export type MnemopiEmbedWorkerHandle = RefCountedWorkerHandle<MnemopiEmbedWorkerInbound, MnemopiEmbedWorkerOutbound> & {
+	/**
+	 * Shared daemon only: ask it to exit because request `stuckId` hung (it
+	 * checks that claim itself), resolving once the line is flushed. Absent on a private child,
+	 * which `terminate()` already SIGKILLs.
+	 */
+	retire?(stuckId: string): Promise<void>;
+};
 
 type PendingRequest =
 	| { kind: "init"; model: MnemopiEmbedModelId; resolve: (error: string | undefined) => void }
@@ -264,7 +272,7 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 	const inbound = new Set<(message: MnemopiEmbedWorkerOutbound) => void>();
 	const errors = new Set<(error: Error) => void>();
 	const queue: MnemopiEmbedWorkerInbound[] = [];
-	let sink: Pick<MnemopiEmbedWorkerHandle, "send" | "terminate" | "ref" | "unref"> | undefined;
+	let sink: Pick<MnemopiEmbedWorkerHandle, "send" | "terminate" | "ref" | "unref" | "retire"> | undefined;
 	let closed = false;
 	let refed = false;
 
@@ -298,6 +306,17 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 			send: message => sendLine(socket, message),
 			ref: () => void socket.ref(),
 			unref: () => void socket.unref(),
+			retire(stuckId) {
+				if (socket.destroyed) return Promise.resolve();
+				const flushed = Promise.withResolvers<void>();
+				socket.once("close", flushed.resolve);
+				// `end` flushes the line before closing; a bare `destroy` could drop it.
+				socket.end(
+					`${JSON.stringify({ type: "shutdown", id: "retire", force: true, stuck: stuckId })}\n`,
+					flushed.resolve,
+				);
+				return flushed.promise;
+			},
 			async terminate() {
 				socket.destroy();
 			},
@@ -357,6 +376,9 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 			queue.length = 0;
 			await sink?.terminate();
 		},
+		async retire(stuckId) {
+			await sink?.retire?.(stuckId);
+		},
 	};
 }
 
@@ -370,19 +392,6 @@ export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}):
 export interface MnemopiSubprocessEmbeddingModel {
 	embed(texts: string[], batchSize?: number): AsyncIterable<number[][]>;
 }
-
-/**
- * Upper bound on a steady-state embed IPC round-trip. Initialization is
- * intentionally exempt: bundled installs may spend several minutes installing
- * fastembed and bootstrapping the model, and killing that worker can strand the
- * runtime install lock. Once initialization succeeds, a longer embed stall
- * means a hung native runtime (issue #4792) that would otherwise pin whatever
- * awaits the embed — a turn's memory recall or the headless shutdown
- * consolidation — indefinitely, leaving the process alive with an unreaped
- * `__omp_worker_mnemopi_embed` child (issue #7352). On expiry the embed fails
- * and the worker is SIGKILL-reaped so the next request respawns a fresh one.
- */
-const EMBED_REQUEST_TIMEOUT_MS = 120_000;
 
 /** Race marker for {@link MnemopiEmbedClient.#awaitRequest}. */
 const REQUEST_TIMED_OUT = Symbol("mnemopi.embed.timedOut");
@@ -399,7 +408,7 @@ export class MnemopiEmbedClient {
 
 	constructor(
 		spawnWorker: () => MnemopiEmbedWorkerHandle = createEmbedWorkerHandle,
-		requestTimeoutMs: number = EMBED_REQUEST_TIMEOUT_MS,
+		requestTimeoutMs: number = embedRequestTimeoutMs(),
 	) {
 		this.#spawnWorker = spawnWorker;
 		this.#requestTimeoutMs = requestTimeoutMs;
@@ -485,7 +494,7 @@ export class MnemopiEmbedClient {
 			// worker's "embed before init" guard. Worker `ensureLoaded` is
 			// idempotent so steady-state embeds pay no extra cost.
 			worker.send({ type: "embed", id, model, cacheDir, texts, batchSize });
-			const result = await this.#awaitRequest(promise);
+			const result = await this.#awaitRequest(promise, id);
 			if (result instanceof Error) throw result;
 			return result;
 		} finally {
@@ -494,23 +503,32 @@ export class MnemopiEmbedClient {
 	}
 
 	/**
-	 * Await one steady-state embed reply, bounded by
-	 * {@link EMBED_REQUEST_TIMEOUT_MS}. The timeout timer is `unref`'d so a
+	 * Await one steady-state embed reply, bounded by `#requestTimeoutMs`
+	 * ({@link embedRequestTimeoutMs}). Initialization is exempt: bundled installs
+	 * may spend minutes bootstrapping the model, and killing that worker can
+	 * strand the runtime install lock. The timeout timer is `unref`'d so a
 	 * pending request has only the worker reference keeping the parent event
-	 * loop alive. On expiry the wedged worker is SIGKILL-reaped via
-	 * {@link terminate} — faulting any other in-flight request and letting the
-	 * next call respawn a fresh child — before the request rejects, so a hung
-	 * native runtime cannot pin a turn's recall or shutdown consolidation
-	 * forever (issue #7352).
+	 * loop alive. On expiry the embed means a hung native runtime (issues #4792,
+	 * #7352). A shared daemon is first asked to retire (`retire` proves the hang
+	 * by naming this request; otherwise it would stay up and time out every other
+	 * session's embeds too), then the worker is reaped via {@link terminate} —
+	 * faulting any other in-flight request and letting the next call respawn a
+	 * fresh worker — before the request rejects.
 	 */
-	async #awaitRequest<T>(promise: Promise<T>): Promise<T> {
+	async #awaitRequest<T>(promise: Promise<T>, id: string): Promise<T> {
 		const { promise: timedOut, resolve: fire } = Promise.withResolvers<typeof REQUEST_TIMED_OUT>();
 		const timer = setTimeout(() => fire(REQUEST_TIMED_OUT), this.#requestTimeoutMs);
 		timer.unref();
 		try {
 			const winner = await Promise.race([promise, timedOut]);
 			if (winner === REQUEST_TIMED_OUT) {
-				void this.terminate();
+				const worker = this.#worker;
+				try {
+					await worker?.retire?.(id);
+				} catch {
+					// Best effort: terminate below drops the connection either way.
+				}
+				if (this.#worker === worker) void this.terminate();
 				throw new Error("mnemopi embed worker request timed out");
 			}
 			return winner;
