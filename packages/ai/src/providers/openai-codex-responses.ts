@@ -4987,6 +4987,9 @@ export function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : CODEX_BASE_URL;
 	const normalized = raw.replace(/\/+$/, "");
 	if (normalized.endsWith("/codex/responses")) return normalized;
+	// Foundry: a base that already names the responses endpoint is used as is. A local gateway (the Caveman proxy) serves
+	// `/chatgpt/responses`, the path Codex CLI posts to, and appending `/codex/responses` to it 404s.
+	if (normalized.endsWith("/responses")) return normalized;
 	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
 	return `${normalized}/codex/responses`;
 }
