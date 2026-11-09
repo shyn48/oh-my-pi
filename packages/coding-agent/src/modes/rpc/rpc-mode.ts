@@ -1054,6 +1054,7 @@ export function requestRpcSelect(
 			title,
 			options: labels,
 			...(optionDetails ? { optionDetails } : {}),
+			...(dialogOptions?.meta ? { meta: dialogOptions.meta } : {}),
 			timeout: dialogOptions?.timeout,
 		},
 		response => parseValueDialogResponse(response, dialogOptions),
@@ -2061,6 +2062,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					})),
 					contextUsage: session.getContextUsage(),
 					goal: session.getGoalModeState() ?? null,
+					foundryBridge: { protocol: 1, approvals: "select-meta-v1" },
 				};
 				return success(id, "get_state", state);
 			}

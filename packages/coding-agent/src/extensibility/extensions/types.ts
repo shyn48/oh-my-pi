@@ -198,6 +198,8 @@ export function timedOutAskDialogResult(questions: ExtensionAskDialogQuestion[])
  */
 export interface ExtensionUIDialogOptions {
 	signal?: AbortSignal;
+	/** Foundry: opaque metadata a host may attach to the dialog request (RPC `select` frames carry it as `meta`). */
+	meta?: Record<string, unknown>;
 	timeout?: number;
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;

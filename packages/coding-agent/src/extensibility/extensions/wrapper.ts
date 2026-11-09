@@ -407,7 +407,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					: basePrompt;
 			let choice: string | undefined;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				// Foundry: the abort signal settles the dialog when the turn is aborted, and `meta` binds the prompt to its call.
+				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"], {
+					signal,
+					meta: { kind: "tool_approval", toolCallId, toolName: this.tool.name, approvalMode },
+				});
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();

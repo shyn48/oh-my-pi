@@ -194,6 +194,8 @@ export interface RpcSessionState {
 	contextUsage?: ContextUsage;
 	/** Current goal-mode state; `null` when the session has no goal. */
 	goal: GoalModeState | null;
+	/** Foundry bridge marker: this build carries the Foundry approval patch (signal + `meta` on tool-approval selects). */
+	foundryBridge?: { protocol: number; approvals: string };
 }
 
 export interface RpcAvailableSlashCommand {
@@ -700,6 +702,7 @@ export type RpcExtensionUIRequest =
 			options: string[];
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
 			timeout?: number;
+			meta?: Record<string, unknown>;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
 	| {
