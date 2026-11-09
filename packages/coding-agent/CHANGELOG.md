@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Mnemopi local embeddings now run in one shared per-machine daemon instead of one ~1 GB subprocess per session. The daemon starts on first use, exits after 10 idle minutes (`MNEMOPI_EMBED_DAEMON_IDLE_MS`), serves one model, and falls back to a private subprocess when unreachable; `MNEMOPI_EMBED_DAEMON=0` always uses the private subprocess.
+
 ## [18.9.1] - 2026-10-11
 
 ### Added

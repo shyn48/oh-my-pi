@@ -1,3 +1,7 @@
+import * as path from "node:path";
+import { getGlobalDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+
 /**
  * Wire types between the parent (`MnemopiEmbedClient`) and the local
  * embeddings subprocess. The parent owns the subprocess lifecycle (graceful
@@ -27,9 +31,49 @@ export type MnemopiEmbedWorkerOutbound =
 	| { type: "ready"; id: string }
 	| { type: "vectors"; id: string; vectors: number[][] }
 	| { type: "error"; id: string; error: string }
-	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> };
+	// `id` is set when the line was caused by that request, so the shared daemon
+	// can forward it to the one client that asked instead of every connection.
+	| { type: "log"; id?: string; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> };
 
 export interface MnemopiEmbedTransport {
 	send(message: MnemopiEmbedWorkerOutbound): void;
 	onMessage(handler: (message: MnemopiEmbedWorkerInbound) => void): () => void;
+}
+
+/**
+ * Daemon-only framing on top of the worker protocol (newline-delimited JSON on
+ * a unix socket / named pipe). `hello`/`welcome` is the build handshake: a
+ * client on a different build asks the daemon to `shutdown` and respawns it.
+ * The per-process child never sees these.
+ */
+export type MnemopiEmbedDaemonInbound =
+	| MnemopiEmbedWorkerInbound
+	| { type: "hello"; id: string; build: string }
+	| { type: "shutdown"; id: string };
+
+export type MnemopiEmbedDaemonOutbound =
+	| MnemopiEmbedWorkerOutbound
+	| { type: "welcome"; id: string; build: string; pid: number };
+
+/**
+ * Daemon build identity. The package version covers releases; bump the revision
+ * when this protocol changes without a version bump (dev checkouts).
+ */
+const PROTOCOL_REV = 1;
+export const MNEMOPI_EMBED_BUILD = `${VERSION}+p${PROTOCOL_REV}`;
+
+/**
+ * Machine-wide runtime dir (0700): one daemon, one lock, one socket for every
+ * omp process of this user. `MNEMOPI_EMBED_DAEMON_DIR` overrides it (tests).
+ */
+export function embedDaemonDir(): string {
+	return process.env.MNEMOPI_EMBED_DAEMON_DIR || getGlobalDaemonRuntimeDir("mnemopi-embed");
+}
+
+/** Unix socket under the runtime dir, or a Windows named pipe keyed by that dir (which sits under the user's home). */
+export function embedDaemonEndpoint(dir: string): string {
+	if (process.platform === "win32") {
+		return `\\\\.\\pipe\\omp-mnemopi-embed-${Bun.hash.wyhash(path.resolve(dir)).toString(16).padStart(16, "0")}`;
+	}
+	return path.join(dir, "embed.sock");
 }

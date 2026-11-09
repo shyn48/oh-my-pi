@@ -1,5 +1,7 @@
+import * as net from "node:net";
 import { isFastembedModelCached } from "@oh-my-pi/pi-mnemopi/core/fastembed-model-cache";
 import { getFastembedCacheDir, logger } from "@oh-my-pi/pi-utils";
+import { MNEMOPI_EMBED_DAEMON_WORKER_ARG } from "../cli/worker-selectors";
 import { trackDownload } from "../downloads/activity";
 import {
 	createUnavailableWorker,
@@ -14,7 +16,16 @@ import {
 	spawnWorkerOrUnavailable,
 	type RefCountedWorkerHandle,
 } from "../subprocess/worker-client";
-import type { MnemopiEmbedModelId, MnemopiEmbedWorkerInbound, MnemopiEmbedWorkerOutbound } from "./embed-protocol";
+import {
+	embedDaemonDir,
+	embedDaemonEndpoint,
+	MNEMOPI_EMBED_BUILD,
+	type MnemopiEmbedDaemonInbound,
+	type MnemopiEmbedDaemonOutbound,
+	type MnemopiEmbedModelId,
+	type MnemopiEmbedWorkerInbound,
+	type MnemopiEmbedWorkerOutbound,
+} from "./embed-protocol";
 
 /**
  * Parent-side handle for the mnemopi embeddings subprocess. The runtime
@@ -38,7 +49,7 @@ export const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
 /**
  * Spawn the mnemopi embeddings worker as a subprocess. Exported for tests and
- * the smoke probe; production callers go through {@link spawnMnemopiEmbedWorker}.
+ * the smoke probe; production callers go through {@link createEmbedWorkerHandle}.
  * The child inherits the parent env — fastembed honours `HF_HUB_*`,
  * `HTTPS_PROXY`, etc., and our `loadFastembed()` reads the same `OMP_*`
  * runtime-install knobs the parent uses.
@@ -91,12 +102,262 @@ function createUnavailableMnemopiEmbedWorker(error: unknown): MnemopiEmbedWorker
 	};
 }
 
-function spawnMnemopiEmbedWorker(): MnemopiEmbedWorkerHandle {
+function spawnMnemopiEmbedProcessWorker(): MnemopiEmbedWorkerHandle {
 	return spawnWorkerOrUnavailable(
 		() => wrapSubprocess(createMnemopiEmbedSubprocess()),
 		createUnavailableMnemopiEmbedWorker,
 		"mnemopi embed worker spawn failed; local embeddings disabled",
 	);
+}
+
+/** Total budget for reaching (starting, if needed) the shared daemon before falling back to a private child. */
+const DAEMON_CONNECT_DEADLINE_MS = 5_000;
+/** A live daemon answers `hello` from its event loop; silence this long means wedged, not busy. */
+const DAEMON_HANDSHAKE_TIMEOUT_MS = 2_000;
+
+export interface EmbedWorkerHandleOptions {
+	/** Runtime dir of the daemon; defaults to the machine-wide one. */
+	dir?: string;
+	/** Build this client expects the daemon to be; a daemon on another build is retired and respawned. */
+	build?: string;
+	/** Start a daemon process detached. Injectable for tests. */
+	spawnDaemon?: () => void;
+	/** Private per-process child used when the daemon is disabled or unreachable. */
+	spawnChild?: () => MnemopiEmbedWorkerHandle;
+	connectDeadlineMs?: number;
+}
+
+function spawnEmbedDaemon(): void {
+	const spawn = resolveWorkerSpawnCmd(MNEMOPI_EMBED_DAEMON_WORKER_ARG);
+	// Detached + unref'd: the daemon outlives this session and serves the next ones.
+	Bun.spawn(spawn.cmd, {
+		cwd: spawn.cwd,
+		env: inferenceWorkerEnv(),
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "ignore",
+		detached: true,
+		windowsHide: true,
+	}).unref();
+}
+
+function openSocket(endpoint: string): Promise<net.Socket> {
+	const { promise, resolve, reject } = Promise.withResolvers<net.Socket>();
+	const socket = net.createConnection({ path: endpoint });
+	socket.setEncoding("utf8");
+	// Permanent: a socket error after connect must never become an uncaught
+	// exception; `close` is what the handle reacts to.
+	socket.on("error", () => {});
+	socket.once("connect", () => {
+		socket.removeListener("error", reject);
+		resolve(socket);
+	});
+	socket.once("error", reject);
+	return promise;
+}
+
+/** First complete JSON line from the daemon, or `undefined` when the socket closes or stays silent. */
+function nextMessage(socket: net.Socket, timeoutMs: number): Promise<MnemopiEmbedDaemonOutbound | undefined> {
+	const { promise, resolve } = Promise.withResolvers<MnemopiEmbedDaemonOutbound | undefined>();
+	let buffer = "";
+	const done = (message: MnemopiEmbedDaemonOutbound | undefined): void => {
+		clearTimeout(timer);
+		socket.removeListener("data", onData);
+		socket.removeListener("close", onClose);
+		resolve(message);
+	};
+	const onData = (chunk: string): void => {
+		buffer += chunk;
+		const newline = buffer.indexOf("\n");
+		if (newline < 0) return;
+		try {
+			done(JSON.parse(buffer.slice(0, newline)) as MnemopiEmbedDaemonOutbound);
+		} catch {
+			done(undefined);
+		}
+	};
+	const onClose = (): void => done(undefined);
+	const timer = setTimeout(onClose, timeoutMs);
+	socket.on("data", onData);
+	socket.once("close", onClose);
+	return promise;
+}
+
+function sendLine(socket: net.Socket, message: MnemopiEmbedDaemonInbound): void {
+	socket.write(`${JSON.stringify(message)}\n`);
+}
+
+/**
+ * Connect to the shared daemon, starting it when nothing listens, and check it
+ * runs our build. Resolves `undefined` when it cannot be reached or must not
+ * be used (wedged, other build still serving other sessions); the caller then
+ * falls back to a private child.
+ */
+async function connectEmbedDaemon(
+	options: Required<Omit<EmbedWorkerHandleOptions, "spawnChild">>,
+	isClosed: () => boolean,
+): Promise<net.Socket | undefined> {
+	const endpoint = embedDaemonEndpoint(options.dir);
+	const deadline = Date.now() + options.connectDeadlineMs;
+	let spawned = false;
+	let retired = false;
+	for (let delay = 25; Date.now() < deadline && !isClosed(); delay = Math.min(delay * 2, 250)) {
+		let socket: net.Socket;
+		try {
+			socket = await openSocket(endpoint);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ECONNREFUSED") return undefined;
+			// Nobody listening. Several sessions may race to spawn here; the
+			// daemon's lock makes all but one exit at once.
+			if (!spawned) {
+				spawned = true;
+				try {
+					options.spawnDaemon();
+				} catch (spawnError) {
+					logger.warn("mnemopi-embed: spawning the shared daemon failed", {
+						error: spawnError instanceof Error ? spawnError.message : String(spawnError),
+					});
+					return undefined;
+				}
+			}
+			await Bun.sleep(delay);
+			continue;
+		}
+		sendLine(socket, { type: "hello", id: "hello", build: options.build });
+		const welcome = await nextMessage(socket, DAEMON_HANDSHAKE_TIMEOUT_MS);
+		if (welcome?.type !== "welcome") {
+			socket.destroy();
+			return undefined;
+		}
+		if (welcome.build === options.build) return socket;
+		// Other build: retire it once and start ours. A daemon that stays up
+		// (refused because other sessions use it, or wedged) means fall back.
+		if (retired) {
+			socket.destroy();
+			return undefined;
+		}
+		retired = true;
+		sendLine(socket, { type: "shutdown", id: "shutdown" });
+		const reply = await nextMessage(socket, DAEMON_HANDSHAKE_TIMEOUT_MS);
+		socket.destroy();
+		if (reply !== undefined) return undefined;
+		spawned = false;
+	}
+	return undefined;
+}
+
+/**
+ * Worker handle for {@link MnemopiEmbedClient}: a connection to the machine-wide
+ * embeddings daemon, so every session shares one loaded model. `send` before
+ * the connection is up is queued. A dropped connection surfaces through
+ * `onError` like a crashed child, so the client rejects what was in flight and
+ * the next call reconnects (respawning the daemon if it died). `terminate()`
+ * only closes our connection — the daemon belongs to every session and exits
+ * on its own when idle. `MNEMOPI_EMBED_DAEMON=0`, or a daemon that cannot be
+ * reached, uses today's private per-process child instead.
+ */
+export function createEmbedWorkerHandle(options: EmbedWorkerHandleOptions = {}): MnemopiEmbedWorkerHandle {
+	const spawnChild = options.spawnChild ?? spawnMnemopiEmbedProcessWorker;
+	if (process.env.MNEMOPI_EMBED_DAEMON === "0") return spawnChild();
+
+	const inbound = new Set<(message: MnemopiEmbedWorkerOutbound) => void>();
+	const errors = new Set<(error: Error) => void>();
+	const queue: MnemopiEmbedWorkerInbound[] = [];
+	let sink: Pick<MnemopiEmbedWorkerHandle, "send" | "terminate" | "ref" | "unref"> | undefined;
+	let closed = false;
+	let refed = false;
+
+	const attach = (target: NonNullable<typeof sink>): void => {
+		sink = target;
+		if (refed) target.ref();
+		else target.unref();
+		for (const message of queue.splice(0)) target.send(message);
+	};
+	const attachSocket = (socket: net.Socket): void => {
+		let buffer = "";
+		socket.on("data", (chunk: string) => {
+			buffer += chunk;
+			for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+				const line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				try {
+					for (const handler of inbound) handler(JSON.parse(line) as MnemopiEmbedWorkerOutbound);
+				} catch (error) {
+					logger.debug("mnemopi-embed: bad daemon line", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		});
+		socket.on("close", () => {
+			if (closed) return;
+			for (const handler of errors) handler(new Error("mnemopi embed daemon connection closed"));
+		});
+		attach({
+			send: message => sendLine(socket, message),
+			ref: () => void socket.ref(),
+			unref: () => void socket.unref(),
+			async terminate() {
+				socket.destroy();
+			},
+		});
+	};
+
+	void connectEmbedDaemon(
+		{
+			dir: options.dir ?? embedDaemonDir(),
+			build: options.build ?? MNEMOPI_EMBED_BUILD,
+			spawnDaemon: options.spawnDaemon ?? spawnEmbedDaemon,
+			connectDeadlineMs: options.connectDeadlineMs ?? DAEMON_CONNECT_DEADLINE_MS,
+		},
+		() => closed,
+	)
+		.catch(() => undefined)
+		.then(socket => {
+			if (closed) {
+				socket?.destroy();
+				return;
+			}
+			if (socket) return attachSocket(socket);
+			logger.warn("mnemopi-embed: shared daemon unavailable; using a private embed subprocess");
+			const child = spawnChild();
+			child.onMessage(message => {
+				for (const handler of inbound) handler(message);
+			});
+			child.onError(error => {
+				for (const handler of errors) handler(error);
+			});
+			attach(child);
+		});
+
+	return {
+		send(message) {
+			if (sink) sink.send(message);
+			else queue.push(message);
+		},
+		onMessage(handler) {
+			inbound.add(handler);
+			return () => inbound.delete(handler);
+		},
+		onError(handler) {
+			errors.add(handler);
+			return () => errors.delete(handler);
+		},
+		ref() {
+			refed = true;
+			sink?.ref();
+		},
+		unref() {
+			refed = false;
+			sink?.unref();
+		},
+		async terminate() {
+			closed = true;
+			queue.length = 0;
+			await sink?.terminate();
+		},
+	};
 }
 
 /**
@@ -137,7 +398,7 @@ export class MnemopiEmbedClient {
 	#requestTimeoutMs: number;
 
 	constructor(
-		spawnWorker: () => MnemopiEmbedWorkerHandle = spawnMnemopiEmbedWorker,
+		spawnWorker: () => MnemopiEmbedWorkerHandle = createEmbedWorkerHandle,
 		requestTimeoutMs: number = EMBED_REQUEST_TIMEOUT_MS,
 	) {
 		this.#spawnWorker = spawnWorker;
